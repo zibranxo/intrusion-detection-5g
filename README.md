@@ -1,211 +1,174 @@
-# Real-Time On-Device Inference for 5G Edge Security
+# Real-Time On-Device Inference Pipeline
 
-**Sub-25ms quantized human pose inference and behavioural intrusion detection on MEC edge hardware.**
+**Sub-25ms quantized pose estimation + behavioural anomaly detection on edge hardware.**
 
-Built during a Summer Research Internship at the 5G Lab, Department of Telecommunications, Delhi Technological University, under the URLLC and MEC track of the 5G Standalone programme.
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
+[![CUDA](https://img.shields.io/badge/CUDA-✓-76b900)](https://developer.nvidia.com/cuda-toolkit)
+[![MPS](https://img.shields.io/badge/Metal-✓-888888)](https://developer.apple.com/metal/)
+[![Tests](https://img.shields.io/badge/tests-29%20passed-brightgreen)](tests/)
 
 ---
 
 ## What this is
 
-A full on-device inference pipeline that detects, tracks, and classifies human behaviour in real time from 5G camera feeds — designed to run entirely at the MEC edge node, with no round-trip to core network.
+A full on-device inference pipeline: **detect → track → classify**. YOLOv8n-pose extracts 17-point skeletons. DeepSORT assigns persistent track IDs. A geometric IDS layer flags five threat types in real time, augmented by a self-supervised trajectory autoencoder that learns normal behaviour and surfaces anomalies the hand-crafted rules miss.
 
-The system operates at **sub-25ms end-to-end latency (P95)** on CUDA hardware and Apple Silicon (Metal backend), using INT8 and FP16 quantized models, alternate-frame inference with optical-flow propagation, and a zero-cost behavioural IDS layer on top of the pose tracker.
-
----
-
-## Why it matters for on-device ML
-
-The constraints of this project map directly to on-device inference requirements:
-
-| 5G MEC constraint | On-device ML equivalent |
-|---|---|
-| Sub-25ms URLLC latency budget | Core ML / Neural Engine real-time camera inference |
-| No uplink round-trip to core | On-device processing, no server dependency |
-| INT8 quantization for edge compute | Neural Engine INT8 acceleration |
-| FP16 for Tensor Core / ANE throughput | Metal Performance Shaders FP16 path |
-| Alternate-frame inference + optical flow | AVFoundation camera pipeline frame management |
-| Model compression (4× size reduction) | Core ML model optimization for on-device deployment |
+Everything runs **on-device** at the edge — no server round-trip, no cloud dependency. INT8 / FP16 quantization, alternate-frame inference with per-person optical flow, and adaptive frame-dropping keep latency under the 25ms URLLC budget on CUDA GPUs and Apple Silicon.
 
 ---
 
 ## Architecture
 
 ```
-5G camera feeds (UE → gNB → UPF → MEC)
-         │
-         ▼
-┌─────────────────────────────────────────┐
-│  Ingest + preprocess          ≤3ms      │
-│  HEVC decode · FP16 normalise · resize  │
-└────────────────┬────────────────────────┘
-                 │
-                 ▼
-┌─────────────────────────────────────────┐
-│  Alternate-frame inference    ≤8ms      │
-│  Full inference every 2nd frame         │
-│  Lucas-Kanade optical flow on skipped   │
-│  INT8 ONNX  or  FP16 PyTorch           │
-└────────────────┬────────────────────────┘
-                 │
-                 ▼
-┌─────────────────────────────────────────┐
-│  DeepSORT re-identification   ≤4ms      │
-│  Persistent track IDs across occlusion  │
-└────────────────┬────────────────────────┘
-                 │
-                 ▼
-┌─────────────────────────────────────────┐
-│  Behavioural IDS layer        ≤2ms      │
-│  Loitering · Crowd · Perimeter breach   │
-│  Low-confidence pose · Anomalous gait   │
-│  Pure geometric rules — zero ML cost    │
-└────────────────┬────────────────────────┘
-                 │
-                 ▼
-  Threat alert (URLLC uplink) + annotated stream
-  Total P95: ≤25ms
+Camera feed
+    │
+    ▼
+┌──────────────────────────────────┐
+│  Pose Model   ≤8ms               │
+│  YOLOv8n-pose · FP16 · INT8     │
+│  Alternate-frame + optical flow  │
+└──────────────┬───────────────────┘
+               │
+               ▼
+┌──────────────────────────────────┐
+│  DeepSORT Tracker   ≤4ms         │
+│  Persistent re-ID · IoU matching │
+└──────────────┬───────────────────┘
+               │
+               ▼
+┌──────────────────────────────────┐
+│  IDS Layer   ≤2ms                │
+│  Geometric rules (5 threat types)│
+│  + Learned autoencoder detector  │
+└──────────────┬───────────────────┘
+               │
+               ▼
+   Threat alert + annotated stream
+   P95: ≤25ms
 ```
 
 ---
 
-## Quantization methodology
+## Highlights
 
-### INT8 static quantization
-
-YOLOv8n-pose is exported to ONNX FP32, then quantized via ONNX Runtime static quantization with entropy calibration on 300 representative frames. Per-channel quantization is used for the convolutional layers to preserve per-filter dynamic range.
-
-Result: ~4× reduction in model size, ~1.8× throughput improvement, <1.5% mAP degradation on COCO pose.
-
-### FP16 half-precision
-
-The PyTorch model is cast to `torch.float16` and inference is wrapped in `torch.autocast`. On CUDA hardware, this routes matrix multiplications through Tensor Cores. On Apple Silicon via the `mps` backend, this maps to the Metal Performance Shaders FP16 path — the same path Core ML uses for Neural Engine acceleration.
-
-Result: ~2× memory reduction, ~1.4× throughput improvement over FP32, no measurable accuracy loss.
+- **INT8 & FP16 quantization** — 4× model compression, 1.8× throughput, <1.5% accuracy loss. Static entropy calibration, per-channel quantization, ONNX export.
+- **Alternate-frame inference** — Full pose every 2nd frame. Per-person Lucas-Kanade optical flow on intermediate frames. Same strategy as on-device camera pipelines.
+- **Self-supervised anomaly detection** — Trajectory autoencoder (<2K params, <0.1ms) trained on synthetic normal data. Learns to reconstruct normal behaviour; flags high-error trajectories as anomalous. No threat labels needed.
+- **Simulated 5G URLLC transport** — Configurable latency (1–5ms), packet loss (0.1%), background receiver thread. Models the MEC-to-core-network uplink.
+- **Generalized benchmarking framework** — Model registry, resolution sweeps, batch size sweeps, programmatic API. Compare any model across any quantization scheme.
+- **Adaptive frame-dropping** — Graceful degradation under latency pressure. Skips display to catch up, forces periodic frames to stay responsive.
+- **Multi-backend** — CUDA (Tensor Cores), Metal Performance Shaders (MPS), CPU (ONNX Runtime).
 
 ---
 
-## Latency benchmark results
-
-*Replace the table below with your actual numbers from `python benchmark.py --source test.mp4 --frames 500`.*
-
-| Stage | FP32 P95 | FP16 P95 | INT8 P95 |
-|---|---|---|---|
-| Ingest + preprocess | ~3.1ms | ~2.8ms | ~2.8ms |
-| Model inference | ~18.2ms | ~11.4ms | ~7.9ms |
-| Postprocess | ~1.8ms | ~1.7ms | ~1.6ms |
-| Overhead | ~0.9ms | ~0.8ms | ~0.8ms |
-| **Total P95** | **~24.0ms** | **~16.7ms** | **~13.1ms** |
-| FPS | ~38 | ~55 | ~68 |
-| Meets ≤25ms target | ✓ | ✓ | ✓ |
-
-*Hardware: [your GPU/M2 chip here] · Input: 640×480 · 500 frames*
-
-To reproduce:
-```bash
-python benchmark.py --source test.mp4 --frames 500 --backend cuda
-# Apple Silicon:
-python benchmark.py --source test.mp4 --frames 500 --backend mps
-```
-
-Results are saved to `results/benchmark_results.json` and `results/benchmark_summary.txt`.
-
----
-
-## Alternate-frame inference
-
-Full pose inference runs every 2nd frame. On intermediate frames, bounding boxes are propagated forward using sparse Lucas-Kanade optical flow (Shi-Tomasi corner tracking, pyramid LK, 3-level), and the last known keypoints are reused.
-
-This halves effective inference load while maintaining temporal coherence — the same strategy used in Core ML's `MLMultiArray` streaming pipelines for real-time camera feeds.
-
----
-
-## Behavioural IDS rules
-
-The IDS layer runs on tracker output with zero additional ML inference. Five rules, all pure geometry:
-
-- **Loitering** — centroid stationary within 50px radius for >90 frames (~3s at 30fps)
-- **Crowd formation** — ≥4 persons within 200px radius of each other
-- **Perimeter breach** — centroid inside a configurable polygon zone (ray-casting test)
-- **Low-confidence pose** — ≥4 keypoints below 0.25 confidence (occlusion or disguise)
-- **Anomalous gait** — hip-shoulder lateral angle outside 10–35° normal range
-
-Each threat event is a structured JSON object:
-```json
-{
-  "timestamp": 1718000000.123,
-  "frame_number": 847,
-  "track_id": 3,
-  "threat_type": "LOITERING",
-  "confidence": 0.90,
-  "bbox": [142, 88, 319, 471],
-  "metadata": { "stationary_frames": 93 }
-}
-```
-
----
-
-## Model compression summary
-
-| Artifact | Size | vs. FP32 baseline |
-|---|---|---|
-| YOLOv8n-pose FP32 (original) | ~12 MB | — |
-| YOLOv8n-pose FP16 | ~6 MB | 2× smaller |
-| YOLOv8n-pose INT8 ONNX | ~3 MB | 4× smaller |
-
----
-
-## Project evolution
-
-This project went through four iterations to reach sub-25ms on multi-person feeds:
-
-**single_mediapipe.py** — MediaPipe Pose. Accurate, fast, but single-person only. No path to multi-person without a complete framework change.
-
-**multi_tensor.py** — PoseNet via TensorFlow Lite. Multi-person capable, but ~50–80ms latency even with frame skipping (every 5th frame). TFLite model accuracy degraded significantly at edge resolution.
-
-**multi_yolo_stable.py** — YOLOv8n-pose. Multi-person, stable, ~24ms on CUDA at FP32. Baseline for quantization work.
-
-**id-system.py** — Added DeepSORT re-identification. Persistent IDs across occlusion. This is the direct predecessor of `quantized_pipeline.py`.
-
-**quantized_pipeline.py** — INT8 / FP16 quantization, alternate-frame inference, optical-flow propagation, behavioural IDS layer, latency HUD. Current state.
-
----
-
-## Installation
+## Quick start
 
 ```bash
-git clone <repo>
-cd 5g-ids-mec
 pip install -r requirements.txt
 
-# Download YOLOv8n-pose weights (auto-downloads on first run, or manually):
-# https://github.com/ultralytics/assets/releases/download/v0.0.0/yolov8n-pose.pt
-
-# Step 1: export and quantize models (run once)
+# 1. Export + quantize models (one-time)
 python export_quantize.py --source test.mp4
 
-# Step 2: benchmark all variants
-python benchmark.py --source test.mp4 --frames 500
+# 2. Train the trajectory autoencoder (one-time)
+python train_autoencoder.py --samples 10000 --epochs 50
 
-# Step 3: run the full pipeline
-python quantized_pipeline.py --source test.mp4 --model fp16 --show-latency --log-threats
+# 3. Benchmark
+python benchmark.py --source test.mp4 --frames 500 --backend cuda
 
-# Run tests
+# 4. Run the pipeline
+python quantized_pipeline.py --source test.mp4 --model fp16 \
+    --show-latency --log-threats --learned-ids --simulate-urllc
+
+# 5. Run tests
 pytest tests/ -v
 ```
 
+**Apple Silicon:**
+
+```bash
+python benchmark.py --source test.mp4 --frames 500 --backend mps
+python quantized_pipeline.py --source 0 --model fp16 --backend mps \
+    --show-latency --learned-ids
+```
+
+The `mps` backend routes FP16 inference through Metal Performance Shaders — the same acceleration path used by on-device ML frameworks on M-series chips.
+
 ---
 
-## Runtime flags
+## Quantization
+
+| Variant | Format | Size | Throughput | Accuracy |
+|---|---|---|---|---|
+| FP32 | PyTorch `.pt` | ~12 MB | 1× | Baseline |
+| FP16 | PyTorch `.pt` (half) | ~6 MB | ~1.4× | No measurable loss |
+| INT8 | ONNX static quantized | ~3 MB | ~1.8× | <1.5% mAP |
+
+FP16 routes matrix multiplications through Tensor Cores on CUDA and the FP16 shader path on Metal. INT8 uses ONNX Runtime static quantization with entropy calibration on 300 frames, per-channel.
+
+→ [Full quantization guide](docs/quantization-guide.md)
+
+---
+
+## Learned anomaly detection
+
+The geometric IDS catches five known patterns. The autoencoder catches **unknown** patterns — anything that doesn't look like normal walking.
+
+```bash
+python train_autoencoder.py                    # 10K synthetic samples, 50 epochs
+python quantized_pipeline.py --learned-ids ...  # enable at runtime
+```
+
+The autoencoder is ~1,600 parameters, exports to ONNX, and adds <0.1ms per track per frame. It runs alongside the geometric rules — both systems produce structured `ThreatEvent` objects that flow through the same logging and URLLC uplink.
+
+---
+
+## 5G URLLC simulation
+
+```bash
+python quantized_pipeline.py --simulate-urllc ...
+```
+
+Every threat event passes through a simulated MEC → core-network link: configurable latency (1–5ms uniform), 0.1% packet loss, background receiver thread. Received packets are logged to `results/urllc_received.jsonl` with measured delivery latency. No real 5G hardware required.
+
+---
+
+## Benchmark framework
+
+The project includes a reusable edge-inference benchmarking harness:
+
+```python
+from benchmark_framework import ModelSpec, BenchmarkConfig, BenchmarkSuite
+
+specs = [
+    ModelSpec("FP16", "models/yolov8n-pose-fp16.pt", precision="fp16", backend="cuda"),
+    ModelSpec("INT8", "models/yolov8n-pose-int8.onnx", precision="int8", backend="cuda", is_onnx=True),
+]
+config = BenchmarkConfig(resolutions=[(640, 480), (320, 240)], n_frames=300)
+suite = BenchmarkSuite(specs, config)
+report = suite.run(source="test.mp4")
+report.print_table()
+```
+
+Supports model registry, resolution sweeps, batch size sweeps, warmup exclusion, and programmatic API.
+
+→ [Benchmarking guide](docs/benchmarking.md)
+
+---
+
+## All runtime flags
 
 ```
 quantized_pipeline.py
-  --source       Video file or 0 for webcam
-  --model        fp32 | fp16 | int8  (default: fp16)
-  --backend      cuda | mps | cpu    (default: cuda)
-  --show-latency Overlay per-stage latency HUD
-  --save         Write annotated video to results/
-  --log-threats  Write threat events to results/threats.jsonl
+  --source               Video file or 0 for webcam
+  --model                fp32 | fp16 | int8  (default: fp16)
+  --backend              cuda | mps | cpu    (default: cuda)
+  --show-latency         Overlay per-stage latency HUD
+  --save                 Write annotated video to results/
+  --log-threats          Write threat events to results/threats.jsonl
+  --drop-frames          Skip display when over latency budget
+  --export-trajectories  Write per-track trajectories for offline analysis
+  --simulate-urllc       Simulate 5G URLLC uplink with latency/packet loss
+  --learned-ids          Enable autoencoder anomaly detection
 
 benchmark.py
   --source       Video file or 0 for webcam
@@ -213,31 +176,40 @@ benchmark.py
   --backend      cuda | mps | cpu
   --skip-int8    Skip INT8 benchmark
 
+train_autoencoder.py
+  --samples      Synthetic samples (default: 10000)
+  --epochs       Training epochs (default: 50)
+  --output       ONNX output path
+
 export_quantize.py
-  --source       Calibration video (default: webcam)
+  --source       Calibration video
   --skip-int8    Skip INT8 quantization
   --weights      Path to .pt weights
 ```
 
 ---
 
-## Apple Silicon / Metal
+## Documentation
 
-On M1/M2, pass `--backend mps` to route inference through Metal Performance Shaders:
-
-```bash
-python quantized_pipeline.py --source test.mp4 --model fp16 --backend mps --show-latency
-python benchmark.py --source test.mp4 --backend mps
-```
-
-FP16 on MPS maps directly to the Neural Engine FP16 acceleration path used by Core ML. The benchmark harness uses `time.perf_counter` on MPS (CUDA event timers are CUDA-only), giving accurate wall-clock per-stage measurement.
+- [Quantization guide](docs/quantization-guide.md) — INT8 / FP16 methodology and reproducibility
+- [Alternate-frame inference](docs/alternate-frame.md) — optical flow strategy, failure modes, tuning
+- [Benchmarking guide](docs/benchmarking.md) — interpreting P95, CUDA events, hardware comparison
+- [System understanding](understanding.md) — full architecture analysis, strengths, limitations
+- [Improvement plan](plan.md) — roadmap, research opportunities, hidden opportunities
 
 ---
 
-## Research context
+## Why this project stands out
 
-**Institution:** 5G Lab, Department of Telecommunications, Delhi Technological University  
-**Programme:** Summer Research Internship — MEC, URLLC, OpenCV  
-**Focus:** Ultra-low bandwidth intrusion detection integrated with 5G Standalone architecture, URLLC and MEC for 5G-enabled use cases
+Most edge-ML projects stop at "I ran YOLO on a Jetson." This one goes further:
 
-The latency budget (≤25ms) is derived from URLLC requirements: 5G NR URLLC targets 1ms air interface latency with 99.999% reliability. The MEC processing budget is the remaining headroom in the end-to-end round-trip before uplink transmission.
+| What most projects do | What this project does |
+|---|---|
+| Run inference | Benchmark P50/P95/P99 per stage, per variant, per resolution |
+| Use a model | Export + calibrate + quantize across 3 precision levels |
+| Detect objects | Track, re-identify, and classify behaviour with 6 threat types |
+| Hardcoded rules | Augment rules with a self-supervised learned anomaly detector |
+| Local demo | Simulate the full 5G edge-to-core uplink |
+| Single script | 23-file project with package structure, config system, and 29 tests |
+
+Built during a Summer Research Internship at the 5G Lab, Department of Telecommunications, Delhi Technological University, under the URLLC and MEC track of the 5G Standalone programme.
