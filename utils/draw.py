@@ -14,7 +14,8 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from ids_layer import ThreatEvent
+from .ids_layer import ThreatEvent
+from config import SKELETON_EDGES, TARGET_LATENCY_MS
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Colour constants (BGR)
@@ -29,17 +30,6 @@ CLR_THREAT    = (0, 80, 255)
 CLR_HUD_OK    = (160, 220, 160)
 CLR_HUD_WARN  = (0, 80, 255)
 CLR_HUD_BG    = (20, 20, 20)
-
-TARGET_LATENCY_MS = 25.0
-
-# COCO 17-point skeleton edge pairs
-SKELETON_EDGES = [
-    (5, 7), (7, 9), (6, 8), (8, 10),        # arms
-    (5, 6),                                   # shoulders
-    (11, 13), (13, 15), (12, 14), (14, 16),  # legs
-    (11, 12),                                 # hips
-    (5, 11), (6, 12),                         # torso
-]
 
 
 # ──────────────────────────────────────────────────────────────────────────────

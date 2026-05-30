@@ -34,16 +34,19 @@ import numpy as np
 import torch
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Constants
+# Configuration  — all constants are imported from config.py
 # ──────────────────────────────────────────────────────────────────────────────
 
-ONNX_INT8_PATH  = "models/yolov8n-pose-int8.onnx"
-ONNX_FP32_PATH  = "models/yolov8n-pose-fp32.onnx"
-YOLO_WEIGHTS    = "yolov8n-pose.pt"
-FP16_PT_PATH    = "models/yolov8n-pose-fp16.pt"
-INPUT_SIZE      = (640, 480)       # (width, height)
-TARGET_LATENCY_MS = 25.0           # sub-25ms end-to-end target
-RESULTS_DIR     = Path("results")
+from config import (
+    FP16_PT_PATH,
+    INPUT_SIZE,
+    ONNX_FP32_PATH,
+    ONNX_INT8_PATH,
+    RESULTS_DIR,
+    TARGET_LATENCY_MS,
+    YOLO_WEIGHTS,
+)
+
 Backend = Literal["cuda", "mps", "cpu"]
 
 

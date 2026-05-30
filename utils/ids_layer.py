@@ -34,23 +34,21 @@ from typing import Optional
 
 import numpy as np
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Constants
-# ──────────────────────────────────────────────────────────────────────────────
-
-LOITER_FRAMES         = 90        # ~3s at 30fps before loitering alert
-LOITER_DISTANCE_PX    = 50        # max centroid drift to still count as "stationary"
-CROWD_THRESHOLD       = 4         # number of persons to trigger crowd alert
-CROWD_RADIUS_PX       = 200       # pixel radius for crowd formation detection
-LOW_CONF_THRESHOLD    = 0.25      # pose keypoint confidence below this = suspicious
-LOW_CONF_KEYPOINTS    = 4         # how many low-conf keypoints needed to trigger
-GAIT_ANGLE_MIN_DEG    = 10.0      # min normal hip-shoulder lateral angle
-GAIT_ANGLE_MAX_DEG    = 35.0      # max normal hip-shoulder lateral angle
-HISTORY_MAXLEN        = 120       # frames of position history per track
-IDS_CONFIDENCE_HIGH   = 0.90
-IDS_CONFIDENCE_MEDIUM = 0.70
-IDS_CONFIDENCE_LOW    = 0.50
+from config import (
+    ALERT_COOLDOWN_FRAMES,
+    CROWD_RADIUS_PX,
+    CROWD_THRESHOLD,
+    GAIT_ANGLE_MAX_DEG,
+    GAIT_ANGLE_MIN_DEG,
+    HISTORY_MAXLEN,
+    IDS_CONFIDENCE_HIGH,
+    IDS_CONFIDENCE_LOW,
+    IDS_CONFIDENCE_MEDIUM,
+    LOITER_DISTANCE_PX,
+    LOITER_FRAMES,
+    LOW_CONF_KEYPOINTS,
+    LOW_CONF_THRESHOLD,
+)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

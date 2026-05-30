@@ -34,7 +34,7 @@ import numpy as np
 import torch
 from deep_sort_realtime.deepsort_tracker import DeepSort
 
-from ids_layer import IDSLayer, ThreatEvent, ThreatType
+from utils.ids_layer import IDSLayer, ThreatEvent, ThreatType
 from utils.draw import (
     draw_skeleton,
     draw_track_label,
@@ -46,34 +46,26 @@ from utils.draw import (
 from utils.logger import ThreatLogger, MetricsLogger
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Constants
+# Configuration  — all constants are imported from config.py
 # ──────────────────────────────────────────────────────────────────────────────
 
-YOLO_WEIGHTS        = "yolov8n-pose.pt"
-ONNX_INT8_PATH      = "models/yolov8n-pose-int8.onnx"
-FP16_PT_PATH        = "models/yolov8n-pose-fp16.pt"
-INPUT_SIZE          = (640, 480)
-TARGET_LATENCY_MS   = 25.0
-
-# Alternate-frame inference — run full inference every N frames,
-# propagate bboxes on intermediate frames via Lucas-Kanade optical flow
-ALT_FRAME_INTERVAL  = 2
-
-# Skeleton edges (COCO 17-point pairs)
-SKELETON_EDGES = [
-    (5, 7), (7, 9), (6, 8), (8, 10),   # arms
-    (5, 6),                               # shoulders
-    (11, 13), (13, 15), (12, 14), (14, 16),  # legs
-    (11, 12),                             # hips
-    (5, 11), (6, 12),                     # torso
-]
-
-# Colours and drawing constants live in utils/draw.py
+from config import (
+    ALT_FRAME_INTERVAL,
+    FLOW_MAX_CORNERS,
+    FLOW_MAX_LEVEL,
+    FLOW_MIN_DISTANCE,
+    FLOW_QUALITY_LEVEL,
+    FLOW_WIN_SIZE,
+    FP16_PT_PATH,
+    INPUT_SIZE,
+    ONNX_INT8_PATH,
+    RESULTS_DIR,
+    TARGET_LATENCY_MS,
+    YOLO_WEIGHTS,
+)
 
 ModelVariant = Literal["fp32", "fp16", "int8"]
 Backend      = Literal["cuda", "mps", "cpu"]
-
-RESULTS_DIR  = Path("results")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -242,16 +234,22 @@ class PoseModel:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Alternate-frame inference with optical-flow propagation
+# Alternate-frame inference with per-person optical-flow propagation
 # ──────────────────────────────────────────────────────────────────────────────
 
 class AltFrameInference:
     """
     Runs full pose inference every ALT_FRAME_INTERVAL frames.
-    On intermediate frames, propagates bounding boxes using sparse
-    Lucas-Kanade optical flow — same approach as Core ML camera pipelines.
 
-    This roughly halves inference cost while maintaining temporal coherence.
+    On intermediate frames, propagates each person's bounding box
+    independently using sparse Lucas-Kanade optical flow.  Each bbox
+    has its own set of Shi-Tomasi corner points and its own flow vector
+    — this fixes the original single-global-vector bug where all bboxes
+    were shifted together regardless of individual motion.
+
+    People whose flow tracking fails (occlusion, exit frame, low texture)
+    keep their last known bbox position.  This is safe because DeepSORT's
+    max_age parameter handles stale tracks.
     """
 
     def __init__(self, model: PoseModel) -> None:
@@ -260,19 +258,24 @@ class AltFrameInference:
         self._last_kps:     list[np.ndarray]            = []
         self._last_bboxes:  list[tuple[int,int,int,int]] = []
         self._prev_gray:    Optional[np.ndarray]         = None
-        self._prev_corners: Optional[np.ndarray]         = None
+
+        # Per-person state — one entry per bbox, indices aligned.
+        # Each entry is an (N, 1, 2) float32 corner array, or None.
+        self._corners_per_bbox: list[Optional[np.ndarray]] = []
+
+    # ── Public interface ─────────────────────────────────────────────────
 
     def process(
         self, frame: np.ndarray
     ) -> tuple[list[np.ndarray], list[tuple[int,int,int,int]], bool]:
         """
-        Process one frame, using full inference or flow propagation.
+        Process one frame — full inference or per-person flow propagation.
 
         Args:
-            frame: BGR frame.
+            frame: BGR frame at INPUT_SIZE resolution.
 
         Returns:
-            Tuple of (keypoints_list, bboxes_list, was_full_inference).
+            (keypoints_list, bboxes_list, was_full_inference).
         """
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         run_full = (self._frame_idx % ALT_FRAME_INTERVAL == 0)
@@ -283,88 +286,136 @@ class AltFrameInference:
             self._last_kps    = kps
             self._last_bboxes = bboxes
             self._prev_gray   = gray
-            self._prev_corners = self._compute_corners(bboxes, frame)
+            self._corners_per_bbox = self._extract_corners_per_bbox(bboxes, frame)
             return kps, bboxes, True
 
-        # Propagate bboxes via optical flow
-        if self._prev_corners is not None and len(self._prev_corners) > 0:
-            propagated = self._propagate_bboxes(gray)
-            if propagated:
-                self._last_bboxes = propagated
-
-        self._prev_gray = gray
+        # ── Flow frame: propagate each person independently ──────────
+        propagated = self._propagate_bboxes_per_person(gray)
+        self._last_bboxes = propagated
+        self._prev_gray   = gray
         return self._last_kps, self._last_bboxes, False
 
-    def _compute_corners(
-        self, bboxes: list[tuple[int,int,int,int]], frame: np.ndarray
-    ) -> Optional[np.ndarray]:
-        """Compute Shi-Tomasi corners within all detected bboxes for flow tracking."""
-        gray       = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        all_points = []
+    # ── Corner extraction (per bbox) ─────────────────────────────────────
+
+    def _extract_corners_per_bbox(
+        self,
+        bboxes: list[tuple[int,int,int,int]],
+        frame: np.ndarray,
+    ) -> list[Optional[np.ndarray]]:
+        """
+        Extract Shi-Tomasi corner points independently for each bbox.
+
+        Returns a list with one entry per bbox: either a (N, 1, 2)
+        float32 corner array with at least 2 points, or None if the
+        bbox region has no trackable texture.
+        """
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        corners_list: list[Optional[np.ndarray]] = []
 
         for x1, y1, x2, y2 in bboxes:
             roi = gray[max(0, y1):y2, max(0, x1):x2]
             if roi.size == 0:
+                corners_list.append(None)
                 continue
-            corners = cv2.goodFeaturesToTrack(
-                roi, maxCorners=8, qualityLevel=0.3, minDistance=7
+
+            pts = cv2.goodFeaturesToTrack(
+                roi,
+                maxCorners=FLOW_MAX_CORNERS,
+                qualityLevel=FLOW_QUALITY_LEVEL,
+                minDistance=FLOW_MIN_DISTANCE,
             )
-            if corners is not None:
-                corners[:, 0, 0] += x1
-                corners[:, 0, 1] += y1
-                all_points.extend(corners.reshape(-1, 2))
+            if pts is not None and len(pts) >= 2:
+                # Shift back to full-frame coordinates
+                pts[:, 0, 0] += x1
+                pts[:, 0, 1] += y1
+                corners_list.append(pts.astype(np.float32))
+            else:
+                corners_list.append(None)
 
-        if not all_points:
-            return None
-        return np.array(all_points, dtype=np.float32).reshape(-1, 1, 2)
+        return corners_list
 
-    def _propagate_bboxes(
+    # ── Per-person propagation ───────────────────────────────────────────
+
+    def _propagate_bboxes_per_person(
         self, curr_gray: np.ndarray
-    ) -> Optional[list[tuple[int,int,int,int]]]:
+    ) -> list[tuple[int,int,int,int]]:
         """
-        Use Lucas-Kanade sparse flow to propagate bboxes one frame forward.
+        Propagate each bounding box independently using its own optical flow.
+
+        For every person we compute a separate Lucas-Kanade flow vector
+        from their tracked corner points.  People whose flow tracking
+        fails (occlusion, exit frame, low texture) keep their last known
+        bbox position — the tracker's max_age handles eventual expiry.
 
         Returns:
-            Propagated bbox list, or None on tracking failure.
+            Propagated bbox list, always same length as _last_bboxes.
         """
-        if self._prev_corners is None or len(self._prev_corners) < 2:
-            return None
+        n = len(self._last_bboxes)
+        if n == 0:
+            return []
 
-        new_corners, status, _ = cv2.calcOpticalFlowPyrLK(
-            self._prev_gray, curr_gray,
-            self._prev_corners, None,
-            winSize=(15, 15), maxLevel=2,
-            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03),
+        # Guard: corner list length must match bbox list length.
+        # This holds because _extract_corners_per_bbox returns one entry
+        # per bbox, and we never change length on flow frames.
+        if len(self._corners_per_bbox) != n:
+            return list(self._last_bboxes)
+
+        propagated: list[tuple[int,int,int,int]] = []
+        new_corners_list: list[Optional[np.ndarray]] = []
+
+        lk_criteria = (
+            cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03
         )
 
-        if new_corners is None or status is None:
-            return None
+        for i in range(n):
+            bbox = self._last_bboxes[i]
+            prev_corners = self._corners_per_bbox[i]
 
-        good_new = new_corners[status.flatten() == 1]
-        good_old = self._prev_corners[status.flatten() == 1]
+            # ── No trackable corners for this person ────────────────
+            if prev_corners is None or len(prev_corners) < 2:
+                propagated.append(bbox)
+                new_corners_list.append(None)
+                continue
 
-        if len(good_new) < 2:
-            return None
+            # ── Lucas-Kanade for this person's points ───────────────
+            new_corners, status, _ = cv2.calcOpticalFlowPyrLK(
+                self._prev_gray, curr_gray,
+                prev_corners, None,
+                winSize=FLOW_WIN_SIZE,
+                maxLevel=FLOW_MAX_LEVEL,
+                criteria=lk_criteria,
+            )
 
-        # Estimate translation vector from median flow
-        flow    = good_new - good_old
-        dx      = float(np.median(flow[:, 0]))
-        dy      = float(np.median(flow[:, 1]))
+            if new_corners is None or status is None:
+                propagated.append(bbox)
+                new_corners_list.append(None)
+                continue
 
-        propagated = [
-            (
+            good_new = new_corners[status.flatten() == 1]
+            good_old = prev_corners[status.flatten() == 1]
+
+            if len(good_new) < 2:
+                # Lost tracking for this person
+                propagated.append(bbox)
+                new_corners_list.append(None)
+                continue
+
+            # ── Per-person median flow → shift this bbox ────────────
+            flow = good_new - good_old
+            dx = float(np.median(flow[:, 0]))
+            dy = float(np.median(flow[:, 1]))
+
+            x1, y1, x2, y2 = bbox
+            propagated.append((
                 int(x1 + dx), int(y1 + dy),
                 int(x2 + dx), int(y2 + dy),
+            ))
+            new_corners_list.append(
+                good_new.reshape(-1, 1, 2).astype(np.float32)
             )
-            for x1, y1, x2, y2 in self._last_bboxes
-        ]
-        self._prev_corners = good_new.reshape(-1, 1, 2)
+
+        self._corners_per_bbox = new_corners_list
         return propagated
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Drawing utilities
-# ──────────────────────────────────────────────────────────────────────────────
 
 
 # ──────────────────────────────────────────────────────────────────────────────

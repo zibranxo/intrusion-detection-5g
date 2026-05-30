@@ -23,15 +23,17 @@ import numpy as np
 import torch
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Constants
+# Configuration  — all constants are imported from config.py
 # ──────────────────────────────────────────────────────────────────────────────
 
-YOLO_WEIGHTS       = "yolov8n-pose.pt"
-ONNX_FP32_PATH     = "models/yolov8n-pose-fp32.onnx"
-ONNX_INT8_PATH     = "models/yolov8n-pose-int8.onnx"
-FP16_PT_PATH       = "models/yolov8n-pose-fp16.pt"
-CALIBRATION_FRAMES = 300       # frames used for INT8 static calibration
-INPUT_SIZE         = (640, 480)# (width, height)
+from config import (
+    CALIBRATION_FRAMES,
+    FP16_PT_PATH,
+    INPUT_SIZE,
+    ONNX_FP32_PATH,
+    ONNX_INT8_PATH,
+    YOLO_WEIGHTS,
+)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
