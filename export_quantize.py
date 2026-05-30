@@ -104,7 +104,10 @@ def export_to_onnx(weights_path: str, output_path: str) -> None:
     # Ultralytics saves to same dir as .pt; move to models/
     generated = Path(weights_path).with_suffix(".onnx")
     if generated.exists() and str(generated) != output_path:
-        generated.rename(output_path)
+        target = Path(output_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # Windows-safe overwrite (rename() fails if target exists)
+        generated.replace(target)
 
     print(f"[export] ✓ ONNX FP32 saved to {output_path}")
 
@@ -132,10 +135,13 @@ def quantize_int8(fp32_onnx_path: str, int8_onnx_path: str,
             QuantType,
             quantize_static,
         )
-        from onnxruntime.quantization.calibrate import CalibrationMethod
+        try:
+            from onnxruntime.quantization import CalibrationMethod  # >= 1.18
+        except ImportError:
+            from onnxruntime.quantization.calibrate import CalibrationMethod  # < 1.18
     except ImportError:
-        print("[quantize] onnxruntime-tools not installed. Skipping INT8.")
-        print("           Install: pip install onnxruntime-tools")
+        print("[quantize] onnxruntime or onnxruntime-tools not installed. Skipping INT8.")
+        print("           Install: pip install onnxruntime onnxruntime-tools")
         return
 
     class PoseCalibrationReader(CalibrationDataReader):
@@ -163,14 +169,26 @@ def quantize_int8(fp32_onnx_path: str, int8_onnx_path: str,
     print(f"[quantize] Running INT8 static calibration ({len(calibration_frames)} frames)...")
     t0 = time.perf_counter()
 
-    quantize_static(
-        model_input=fp32_onnx_path,
-        model_output=int8_onnx_path,
-        calibration_data_reader=PoseCalibrationReader(calibration_frames),
-        quant_type=QuantType.QInt8,
-        calibrate_method=CalibrationMethod.Entropy,
-        per_channel=True,
-    )
+    import inspect
+
+    qsig = inspect.signature(quantize_static)
+    qkwargs = {
+        "model_input": fp32_onnx_path,
+        "model_output": int8_onnx_path,
+        "calibration_data_reader": PoseCalibrationReader(calibration_frames),
+        "calibrate_method": CalibrationMethod.Entropy,
+        "per_channel": True,
+    }
+
+    # ONNX Runtime API compatibility:
+    #   - older versions use quant_type
+    #   - newer versions use weight_type
+    if "weight_type" in qsig.parameters:
+        qkwargs["weight_type"] = QuantType.QInt8
+    elif "quant_type" in qsig.parameters:
+        qkwargs["quant_type"] = QuantType.QInt8
+
+    quantize_static(**qkwargs)
 
     elapsed = time.perf_counter() - t0
     print(f"[quantize] ✓ INT8 model saved to {int8_onnx_path}  ({elapsed:.1f}s)")
