@@ -44,6 +44,8 @@ from utils.draw import (
     draw_restricted_zones,
 )
 from utils.logger import ThreatLogger, MetricsLogger
+from utils.trajectory_exporter import TrajectoryExporter
+from utils.learned_ids import LearnedIDSLayer
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Configuration  — all constants are imported from config.py
@@ -57,7 +59,12 @@ from config import (
     FLOW_QUALITY_LEVEL,
     FLOW_WIN_SIZE,
     FP16_PT_PATH,
+    FRAME_BUDGET_MS,
+    FRAME_DROP_ENABLED,
     INPUT_SIZE,
+    KEYPOINT_DIST_FALLBACK,
+    KEYPOINT_IOU_MIN,
+    MAX_CONSECUTIVE_DROPS,
     ONNX_INT8_PATH,
     RESULTS_DIR,
     TARGET_LATENCY_MS,
@@ -419,6 +426,93 @@ class AltFrameInference:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Keypoint-to-track association  (IoU-based, replaces centroid matching)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+    """Intersection over Union for two (x1,y1,x2,y2) bounding boxes."""
+    x1 = max(a[0], b[0])
+    y1 = max(a[1], b[1])
+    x2 = min(a[2], b[2])
+    y2 = min(a[3], b[3])
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    area_a = (a[2] - a[0]) * (a[3] - a[1])
+    area_b = (b[2] - b[0]) * (b[3] - b[1])
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _associate_keypoints_iou(
+    tracks: list,
+    kps_list: list[np.ndarray],
+    bboxes_list: list[tuple[int, int, int, int]],
+    iou_min: float = 0.3,
+    dist_fallback: float = 80.0,
+) -> dict[int, np.ndarray]:
+    """
+    Greedy IoU-based association of detection keypoints to tracker tracks.
+
+    IoU is a better metric than centroid distance because two people with
+    overlapping boxes but different IoU scores won't have keypoints swapped
+    (the original centroid-distance bug).  Falls back to centroid distance
+    when no pair meets the IoU threshold.
+
+    Args:
+        tracks:        Confirmed DeepSORT Track objects.
+        kps_list:      Keypoint arrays from the pose model (one per detection).
+        bboxes_list:   Bounding boxes from the pose model (aligned with kps_list).
+        iou_min:       Minimum IoU to accept an association.
+        dist_fallback: Max centroid pixel distance for fallback matching.
+
+    Returns:
+        Mapping from track_id → (17,3) keypoint array.
+    """
+    kp_by_id: dict[int, np.ndarray] = {}
+    used: set[int] = set()  # indices of kps_list / bboxes_list already claimed
+
+    for track in tracks:
+        track_bbox = tuple(map(int, track.to_tlbr()))
+
+        # ── Pass 1: IoU-based association ────────────────────────────
+        best_iou = iou_min
+        best_idx = -1
+        for i, det_bbox in enumerate(bboxes_list):
+            if i in used:
+                continue
+            score = _iou(track_bbox, det_bbox)
+            if score > best_iou:
+                best_iou = score
+                best_idx = i
+
+        if best_idx >= 0:
+            kp_by_id[track.track_id] = kps_list[best_idx]
+            used.add(best_idx)
+            continue
+
+        # ── Pass 2: centroid-distance fallback ───────────────────────
+        tcx = (track_bbox[0] + track_bbox[2]) / 2
+        tcy = (track_bbox[1] + track_bbox[3]) / 2
+        best_dist = dist_fallback
+        best_idx = -1
+
+        for i, det_bbox in enumerate(bboxes_list):
+            if i in used:
+                continue
+            bcx = (det_bbox[0] + det_bbox[2]) / 2
+            bcy = (det_bbox[1] + det_bbox[3]) / 2
+            dist = ((tcx - bcx) ** 2 + (tcy - bcy) ** 2) ** 0.5
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = i
+
+        if best_idx >= 0:
+            kp_by_id[track.track_id] = kps_list[best_idx]
+            used.add(best_idx)
+
+    return kp_by_id
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Main pipeline
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -429,6 +523,10 @@ def run_pipeline(
     show_latency: bool,
     save_output: bool,
     log_threats: bool,
+    drop_frames: bool = True,
+    export_trajectories: bool = False,
+    simulate_urllc: bool = False,
+    learned_ids_enabled: bool = False,
 ) -> None:
     """
     Run the full 5G MEC IDS pipeline.
@@ -440,12 +538,15 @@ def run_pipeline(
       4. Annotated frame render + optional display
 
     Args:
-        source:        Video file path or webcam index.
-        model_variant: 'fp32', 'fp16', or 'int8'.
-        backend:       'cuda', 'mps', or 'cpu'.
-        show_latency:  Overlay latency HUD on output frames.
-        save_output:   Write annotated video to results/.
-        log_threats:   Write threat events to results/threats.jsonl.
+        source:               Video file path or webcam index.
+        model_variant:        'fp32', 'fp16', or 'int8'.
+        backend:              'cuda', 'mps', or 'cpu'.
+        show_latency:         Overlay latency HUD on output frames.
+        save_output:          Write annotated video to results/.
+        log_threats:          Write threat events to results/threats.jsonl.
+        drop_frames:          Skip display when over latency budget.
+        export_trajectories:  Write per-track trajectories for offline analysis.
+        simulate_urllc:       Simulate 5G URLLC uplink with latency/packet loss.
     """
     RESULTS_DIR.mkdir(exist_ok=True)
 
@@ -477,14 +578,47 @@ def run_pipeline(
         backend=backend,
     )
 
+    # ── Trajectory export ─────────────────────────────────────────────────
+    traj_exporter = None
+    if export_trajectories:
+        from config import TRAJECTORY_EXPORT_DIR
+        TRAJECTORY_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+        traj_path = TRAJECTORY_EXPORT_DIR / f"session_{model_variant}.jsonl"
+        traj_exporter = TrajectoryExporter(str(traj_path))
+        print(f"[pipeline] Trajectory export → {traj_path}")
+
+    # ── URLLC simulated transport ─────────────────────────────────────────
+    urllc_receiver = None
+    urllc_transport = None
+    if simulate_urllc:
+        from urllc import URLLCReceiver, URLLCTransport
+        urllc_path = str(RESULTS_DIR / "urllc_received.jsonl")
+        urllc_receiver = URLLCReceiver(urllc_path)
+        urllc_transport = URLLCTransport(urllc_receiver)
+        print(f"[pipeline] URLLC simulation active → {urllc_path}")
+
+    # ── Learned IDS (autoencoder anomaly detection) ──────────────────────
+    learned_ids = None
+    if learned_ids_enabled:
+        from config import AE_ONNX_PATH
+        learned_ids = LearnedIDSLayer(onnx_path=AE_ONNX_PATH)
+        print(f"[pipeline] Learned IDS active → {AE_ONNX_PATH}")
+
     frame_number   = 0
     fps_tracker    = FPSTracker(window=30)
     all_threats:   list[ThreatEvent] = []
+
+    # Frame-dropping state
+    frame_budget_s   = FRAME_BUDGET_MS / 1000.0
+    consecutive_drops = 0
+    frames_dropped    = 0
 
     print(f"[pipeline] Starting  source={source}  variant={model_variant}  backend={backend}")
     print(f"[pipeline] Press 'q' to quit, 's' to toggle latency HUD.\n")
 
     while True:
+        frame_start = time.perf_counter()
+
         ret, raw_frame = cap.read()
         if not ret:
             break
@@ -507,19 +641,11 @@ def run_pipeline(
         # ── Stage 3: IDS analysis ─────────────────────────────────────────
         confirmed_tracks = [t for t in tracks if t.is_confirmed()]
 
-        # Map keypoints to track IDs by proximity of centroids
-        kp_by_id: dict[int, np.ndarray] = {}
-        for track in confirmed_tracks:
-            tx1, ty1, tx2, ty2 = map(int, track.to_tlbr())
-            tcx, tcy = (tx1 + tx2) / 2, (ty1 + ty2) / 2
-            best_dist, best_kp = float("inf"), None
-            for kp_arr, (bx1, by1, bx2, by2) in zip(kps_list, bboxes_list):
-                bcx, bcy = (bx1 + bx2) / 2, (by1 + by2) / 2
-                dist = ((tcx - bcx) ** 2 + (tcy - bcy) ** 2) ** 0.5
-                if dist < best_dist:
-                    best_dist, best_kp = dist, kp_arr
-            if best_kp is not None and best_dist < 80:
-                kp_by_id[track.track_id] = best_kp
+        # ── Map keypoints to track IDs by IoU (avoids centroid-swap bug) ──
+        kp_by_id = _associate_keypoints_iou(
+            confirmed_tracks, kps_list, bboxes_list,
+            iou_min=KEYPOINT_IOU_MIN, dist_fallback=KEYPOINT_DIST_FALLBACK,
+        )
 
         threats = ids_layer.update(confirmed_tracks, kp_by_id, frame_number)
         t3      = time.perf_counter()
@@ -532,6 +658,32 @@ def run_pipeline(
             if threat_logger:
                 for threat in threats:
                     threat_logger.log(threat)
+            # URLLC uplink simulation
+            if urllc_transport:
+                for threat in threats:
+                    urllc_transport.send(threat)
+
+        # ── Learned IDS (autoencoder) ─────────────────────────────────
+        if learned_ids:
+            learned_threats = learned_ids.score_frame(
+                confirmed_tracks, kp_by_id, frame_number,
+                frame_shape=(INPUT_SIZE[1], INPUT_SIZE[0]),
+            )
+            if learned_threats:
+                threats.extend(learned_threats)
+                for t in learned_threats:
+                    print(t)
+                if threat_logger:
+                    for t in learned_threats:
+                        threat_logger.log(t)
+                if urllc_transport:
+                    for t in learned_threats:
+                        urllc_transport.send(t)
+
+        # ── Trajectory export ─────────────────────────────────────────────
+        if traj_exporter:
+            traj_exporter.record(frame_number, confirmed_tracks,
+                                 kp_by_id, threats)
 
         # ── Stage 4: Annotate frame ───────────────────────────────────────
         t4 = time.perf_counter()
@@ -561,16 +713,33 @@ def run_pipeline(
         metrics_logger.record(stage_times, fps_tracker.fps)
         fps_tracker.tick()
 
+        # ── Frame-dropping: skip display when over latency budget ─────
+        elapsed = time.perf_counter() - frame_start
+        over_budget = (FRAME_DROP_ENABLED and drop_frames
+                       and elapsed > frame_budget_s)
+
+        should_display = True
+        if over_budget:
+            consecutive_drops += 1
+            if consecutive_drops > MAX_CONSECUTIVE_DROPS:
+                # Force a display frame so the window doesn't hang.
+                consecutive_drops = 0
+            else:
+                should_display = False
+                frames_dropped += 1
+
+        # Always write to output video (even when skipping display).
         if out_writer:
             out_writer.write(frame)
 
-        cv2.imshow(f"5G MEC IDS — {model_variant.upper()} | {backend}", frame)
-
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord("q"):
-            break
-        if key == ord("s"):
-            show_latency = not show_latency
+        if should_display:
+            cv2.imshow(f"5G MEC IDS — {model_variant.upper()} | {backend}", frame)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                break
+            if key == ord("s"):
+                show_latency = not show_latency
+            consecutive_drops = 0
 
         frame_number += 1
 
@@ -580,11 +749,18 @@ def run_pipeline(
         out_writer.release()
     cv2.destroyAllWindows()
 
+    if traj_exporter:
+        traj_exporter.close()
+    if urllc_receiver:
+        urllc_receiver.close()
+    if learned_ids:
+        pass  # no explicit close needed; ONNX session cleaned up on GC
     if threat_logger:
         threat_logger.close()
     metrics_logger.close()
 
-    print(f"\n[pipeline] Done. {frame_number} frames  |  {len(all_threats)} threat events")
+    dropped_str = f"  |  {frames_dropped} display frames dropped" if frames_dropped else ""
+    print(f"\n[pipeline] Done. {frame_number} frames{dropped_str}  |  {len(all_threats)} threat events")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -626,6 +802,14 @@ def main() -> None:
     parser.add_argument("--show-latency", action="store_true", help="Overlay latency HUD")
     parser.add_argument("--save",         action="store_true", help="Save annotated video to results/")
     parser.add_argument("--log-threats",  action="store_true", help="Log threats to results/threats.jsonl")
+    parser.add_argument("--drop-frames",  action="store_true",
+                        help="Skip display when over latency budget")
+    parser.add_argument("--export-trajectories", action="store_true",
+                        help="Export per-track trajectories for offline analysis")
+    parser.add_argument("--simulate-urllc", action="store_true",
+                        help="Simulate 5G URLLC uplink with latency and packet loss")
+    parser.add_argument("--learned-ids", action="store_true",
+                        help="Enable learned anomaly detection via trajectory autoencoder")
     args = parser.parse_args()
 
     source: str | int = int(args.source) if args.source.isdigit() else args.source
@@ -637,6 +821,10 @@ def main() -> None:
         show_latency=args.show_latency,
         save_output=args.save,
         log_threats=args.log_threats,
+        drop_frames=args.drop_frames,
+        export_trajectories=args.export_trajectories,
+        simulate_urllc=args.simulate_urllc,
+        learned_ids_enabled=args.learned_ids,
     )
 
 

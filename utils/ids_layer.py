@@ -61,6 +61,7 @@ class ThreatType(str, Enum):
     PERIMETER_BREACH = "PERIMETER_BREACH"
     LOW_CONFIDENCE   = "LOW_CONFIDENCE"
     ANOMALOUS_GAIT   = "ANOMALOUS_GAIT"
+    LEARNED_ANOMALY  = "LEARNED_ANOMALY"   # autoencoder reconstruction error spike
 
 
 @dataclass

@@ -69,3 +69,42 @@ SKELETON_EDGES: list[tuple[int, int]] = [
     (11, 12),                                    # hips
     (5, 11), (6, 12),                            # torso
 ]
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Frame-dropping  (graceful degradation under latency pressure)
+# ══════════════════════════════════════════════════════════════════════════════
+
+FRAME_DROP_ENABLED   = True   # set False to disable adaptive frame dropping
+FRAME_BUDGET_MS      = 33.3    # per-frame time budget (1000/30 fps)
+FRAME_DROP_DISPLAY   = True   # when over budget, skip cv2.imshow to catch up
+MAX_CONSECUTIVE_DROPS = 3     # safety limit — if we drop this many in a row,
+                               # force a full frame anyway to keep the display alive
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Keypoint-to-track association
+# ══════════════════════════════════════════════════════════════════════════════
+
+KEYPOINT_IOU_MIN      = 0.3   # minimum IoU for associating a detection bbox
+                               # with a DeepSORT track bbox
+KEYPOINT_DIST_FALLBACK = 80   # px — fallback centroid distance if IoU is zero
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Simulated 5G URLLC link
+# ══════════════════════════════════════════════════════════════════════════════
+
+URLLC_LATENCY_MS_MIN  = 1.0   # min one-way MEC → core network latency
+URLLC_LATENCY_MS_MAX  = 5.0   # max one-way latency (URLLC budget)
+URLLC_PACKET_LOSS_RATE = 0.001  # 0.1 % — URLLC reliability target
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Trajectory export  (for training data / offline analysis)
+# ══════════════════════════════════════════════════════════════════════════════
+
+TRAJECTORY_EXPORT_DIR  = RESULTS_DIR / "trajectories"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Learned anomaly detection  (trajectory autoencoder)
+# ══════════════════════════════════════════════════════════════════════════════
+
+AE_ONNX_PATH       = "models/trajectory_ae.onnx"   # trained autoencoder
+AE_ANOMALY_THRESHOLD = 0.05  # fallback; usually loaded from {AE_ONNX_PATH}.threshold.txt
